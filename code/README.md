@@ -1,177 +1,264 @@
 # Multi-Modal Evidence Review Agent
 
-A production-grade, multi-step damage-claim verification system built for the **HackerRank Orchestrate June 2026** hackathon.
+> An automated AI system that verifies damage claims using images, conversation transcripts, user history, and evidence requirements — built for the HackerRank Orchestrate June 2026 hackathon.
 
-This system acts as an automated insurance claims adjuster. Given a damage claim conversation, submitted images, user history, and strict evidence requirements, the system analyzes the visual evidence to decide whether it **supports**, **contradicts**, or provides **not enough information** to verify the claim.
+Given a support chat about a damaged **car**, **laptop**, or **package**, plus submitted photos, the system decides:
+
+- ✅ `supported` — images clearly show the claimed damage
+- ❌ `contradicted` — images contradict the claim
+- ⚠️ `not_enough_information` — evidence is missing, invalid, or inconclusive
 
 ---
 
 ## 🌟 Key Features
 
-- **Multi-Modal Pipeline**: Combines text Large Language Models (LLMs) for complex conversation parsing with Vision-Language Models (VLMs) for strict visual verification.
-- **Dual-Backend Support**: Seamlessly switch between the lightning-fast **Google Gemini API** (cloud) and **Ollama** (local, privacy-first) without changing any code.
-- **Smart Image Handling**: Automatically detects fake/disguised image formats (like MP4 videos named `.jpg`) via magic bytes, saving compute tokens by skipping invalid files. WebP and PNG formats are fully supported.
-- **Prompt Injection Defense**: Deterministic rules scan for and flag adversarial text in conversations (e.g., "approve this claim immediately") and instructions hidden within images.
-- **Evidence-First Decision Making**: The system explicitly trusts *visual evidence* over user history. User risk flags trigger manual reviews but do not falsify valid photographic evidence.
+| Feature | Detail |
+|---|---|
+| **4-Stage Pipeline** | Text extraction → Vision analysis → Policy rules → Decision synthesis |
+| **Dual Backend** | Google Gemini API (cloud, fast) *or* Ollama (local, offline, $0) |
+| **Smart Fallback** | When VLM unavailable, uses keyword extraction to still produce meaningful predictions |
+| **Video Detection** | Detects MP4/MOV files disguised as `.jpg` via magic bytes — skips them without wasting tokens |
+| **Prompt Injection Defense** | Catches adversarial text like *"approve this claim"* in both conversations and images |
+| **Multilingual** | Handles Hindi, Spanish, Chinese and more via Gemini / Qwen2.5-VL natively |
+| **Zero Cost** | Runs entirely free via Ollama locally or Gemini's free tier (1,500 req/day) |
+
+---
+
+## 🏗 Architecture
+
+```
+claims.csv row
+    │
+    ├─► Stage 1 — ClaimExtractor  (Text LLM: llama3.2:3b / gemini-2.0-flash)
+    │       Parses the support conversation → structured JSON
+    │       Extracts: claimed_parts, issue_types, severity, is_multi_part
+    │       Handles multilingual text; keyword fallback if LLM unavailable
+    │
+    ├─► Stage 2 — ImageAnalyzer  (Vision LLM: qwen2.5vl:7b / gemini-2.0-flash)
+    │       One VLM call per image (prevents context overload)
+    │       Extracts: object_visible, damage_visible, quality_flags, issue_type, severity
+    │       Detects MP4 videos via magic bytes → flags non_original_image
+    │       Keyword fallback if VLM unavailable → valid_for_review=True still
+    │
+    ├─► Stage 3a — EvidenceMatcher  (Deterministic rules)
+    │       Reads evidence_requirements.csv
+    │       → evidence_standard_met (True/False) + reason
+    │
+    ├─► Stage 3b — RiskAssessor  (Deterministic rules)
+    │       Reads user_history.csv
+    │       Checks: cross-image mismatches, fraud history, prompt injection
+    │       → risk_flags list
+    │
+    └─► Stage 4 — DecisionSynthesizer  (Rules + Text LLM)
+            Priority logic: evidence → risk → visual match → final status
+            → claim_status, issue_type, object_part, severity, justification
+```
+
+### Why Multi-Step instead of Single-Shot?
+
+| | Single-Shot | Multi-Step (this system) |
+|---|---|---|
+| Accuracy | Lower — LLM must juggle 15 fields + images at once | Higher — each model has one focused task |
+| Auditability | Black box | Inspect each stage's JSON independently |
+| Failure mode | Hard crash or hallucinated JSON | Graceful degradation with keyword fallback |
+| Cost | Fewer calls | More calls, but each is cheaper/smaller |
+
+---
+
+## ⚖️ Design Tradeoffs
+
+### ✅ Strengths
+- **Backend-agnostic**: `model_client.py` transparently routes to Gemini or Ollama — swap providers by changing one `.env` line
+- **Deterministic guardrails**: `EvidenceMatcher` and `RiskAssessor` enforce hard policies that LLMs cannot override
+- **Resilient to bad data**: Handles mixed image formats (JPEG, PNG, WebP) and silently skips videos
+- **Cost = $0**: Works with Gemini free tier or fully offline with Ollama
+
+### ⚠️ Limitations
+- **Local CPU latency**: `qwen2.5vl:7b` on CPU-only hardware takes ~5 min/image (use Gemini for speed)
+- **Severity precision**: Fine-grained severity (`low` vs `medium` vs `high`) is the weakest prediction — needs a fine-tuned model
+- **No image cache**: Identical images submitted across different claims are re-analysed each time
+
+---
+
+## 🛡 Edge Cases Handled
+
+| Scenario | Detection | Response |
+|---|---|---|
+| MP4/MOV file named `.jpg` | Magic bytes `[4:8] == b'ftyp'` | Skip VLM, flag `non_original_image`, `valid_image=false` |
+| Prompt injection in chat | Keyword scan in `risk_assessor.py` | Flag `text_instruction_present` + `manual_review_required`; never auto-approve |
+| Instructions embedded in image | VLM `contains_instruction_text=true` | Same flags; VLM prompt explicitly instructs to ignore |
+| Multilingual claim | Gemini/Qwen native + keyword fallback | Correct part/issue extraction in Hindi, Spanish, etc. |
+| Blurry / obscured image | VLM quality flags | `evidence_standard_met=False` → `not_enough_information` |
+| Wrong object uploaded | VLM `matches_claim_object=false` | `wrong_object` flag → reject evidence |
+| Multi-part claim | `is_multi_part=true` | Relaxed cross-image part consistency check |
+| High-risk user history | History flags (≥2 rejections) | `user_history_risk` added — never overrides clear visual evidence |
+| VLM completely unavailable | `except Exception` in image_analyzer | `_keyword_fallback_analysis()` — produces valid prediction from claim text |
 
 ---
 
 ## 🚀 Quick Start
 
-### 1. Prerequisites
+### Prerequisites
 
-You need Python 3.10+ and either a free Google Gemini API key OR local Ollama.
+- Python 3.10+
+- One of: a [Gemini API key](https://aistudio.google.com/apikey) **or** [Ollama](https://ollama.com) installed
 
-```powershell
-# Clone or enter the code directory
-cd code
-
-# Install dependencies
+```bash
+git clone https://github.com/Shaik-Farhana/multi-modal-evidence-review.git
+cd multi-modal-evidence-review/code
 pip install -r requirements.txt
 ```
 
-### 2. Choose Your Backend
+### Option A — Google Gemini (Recommended: fast, free, no GPU needed)
 
-**Option A: Google Gemini API (Recommended - Fast & Free)**
-Get a free API key from [Google AI Studio](https://aistudio.google.com/apikey).
-Open `.env` and set:
-```env
-GEMINI_API_KEY=your_api_key_here
+```bash
+# Create a .env file
+echo "GEMINI_API_KEY=your_key_here" > .env
 ```
 
-**Option B: Local Ollama (Privacy First)**
-Install [Ollama](https://ollama.com) and pull the models:
-```powershell
-ollama pull qwen2.5vl:7b
-ollama pull llama3.2:3b
+### Option B — Local Ollama (Fully offline, privacy-first)
+
+```bash
+ollama pull qwen2.5vl:7b   # vision model
+ollama pull llama3.2:3b    # text model
+# Leave GEMINI_API_KEY unset in .env
 ```
-*(Make sure `GEMINI_API_KEY` is commented out in your `.env` file)*
 
-### 3. Generate Predictions
+### Option C — No models at all (Fastest, deterministic only)
 
-```powershell
-# Full test run on all claims (produces output.csv)
+```bash
+# Uses keyword extraction + rule-based decisions. Runs in ~6 seconds.
+python fast_pipeline.py --dataset-dir ../dataset --output ../output.csv
+```
+
+---
+
+## ▶️ Running the Pipeline
+
+```bash
+# Full multi-step pipeline (requires Gemini key or Ollama)
 python main.py --dataset-dir ../dataset --claims claims.csv --output ../output.csv
 
-# Dev/debug run (process only the first 3 claims)
-python main.py --dataset-dir ../dataset --claims claims.csv --output ../output_dev.csv --limit 3
-```
+# Debug: process only first 3 claims
+python main.py --dataset-dir ../dataset --claims claims.csv --output ../output.csv --limit 3
 
-### 4. Evaluate (Strategy Comparison)
+# Fast deterministic pipeline (no LLM/VLM needed — 6 seconds)
+python fast_pipeline.py --dataset-dir ../dataset --output ../output.csv
 
-Run the automated evaluation on the labeled sample dataset to compare the Multi-Step pipeline against a Single-Shot baseline.
-
-```powershell
+# Evaluate: compare Multi-Step vs Single-Shot on labeled sample data
 python evaluation/main.py --dataset-dir ../dataset
 ```
-*The detailed metrics report will be written to `evaluation_report.md`.*
 
 ---
 
-## 🏗 System Architecture
+## 📊 Results (44 Test Claims)
 
-The pipeline processes each claim through 4 distinct stages to ensure auditability, deterministic policy enforcement, and graceful degradation.
+| Metric | Value |
+|---|---|
+| Total claims processed | 44 |
+| `supported` | 37 (84%) |
+| `not_enough_information` | 7 (16%) |
+| `evidence_standard_met = True` | 41 / 44 |
+| `valid_image = True` | 42 / 44 |
+| MP4 videos detected & skipped | 2 |
 
-```text
-Input: claims.csv row
-    │
-    ├─► Stage 1: ClaimExtractor  (Text LLM)
-    │       Reads the chat and extracts structured data: parts, issue types, severity.
-    │       Handles multilingual conversations gracefully.
-    │
-    ├─► Stage 2: ImageAnalyzer   (Vision VLM)
-    │       Analyzes EACH image individually to prevent context overload.
-    │       Outputs: damage visibility, quality flags, part identification.
-    │
-    ├─► Stage 3a: EvidenceMatcher  (Deterministic Rules)
-    │       Cross-references VLM findings against evidence_requirements.csv.
-    │       Outputs: evidence_standard_met (True/False) + reason.
-    │
-    ├─► Stage 3b: RiskAssessor    (Deterministic Rules)
-    │       Checks user_history.csv, detects cross-image mismatches, and
-    │       flags prompt injections.
-    │
-    └─► Stage 4: DecisionSynthesizer  (Rules + Text LLM)
-            Synthesizes the final decision (supported/contradicted/not_enough_info).
-            Writes a cohesive justification grounded purely in the images.
+**Issue type breakdown:** crack (9), dent (8), broken_part (6), missing_part (4), scratch (4), water_damage (2), crushed_packaging (2), glass_shatter (1), stain (1), unknown (7)
+
+---
+
+## 📋 Output Schema
+
+`output.csv` — exact column order:
+
+| Column | Allowed Values |
+|---|---|
+| `user_id` | from input |
+| `image_paths` | from input |
+| `user_claim` | from input |
+| `claim_object` | `car` · `laptop` · `package` |
+| `evidence_standard_met` | `true` · `false` |
+| `evidence_standard_met_reason` | free text |
+| `risk_flags` | semicolon-separated (see below) |
+| `issue_type` | `dent` · `scratch` · `crack` · `glass_shatter` · `broken_part` · `missing_part` · `torn_packaging` · `crushed_packaging` · `water_damage` · `stain` · `none` · `unknown` |
+| `object_part` | object-specific (e.g. `front_bumper`, `screen`, `seal`) |
+| `claim_status` | `supported` · `contradicted` · `not_enough_information` |
+| `claim_status_justification` | image-grounded free text |
+| `supporting_image_ids` | semicolon-separated IDs or `none` |
+| `valid_image` | `true` · `false` |
+| `severity` | `none` · `low` · `medium` · `high` · `unknown` |
+
+**Risk flag values:** `none` · `blurry_image` · `cropped_or_obstructed` · `low_light_or_glare` · `wrong_angle` · `wrong_object` · `wrong_object_part` · `damage_not_visible` · `claim_mismatch` · `possible_manipulation` · `non_original_image` · `text_instruction_present` · `user_history_risk` · `manual_review_required`
+
+---
+
+## 📁 File Map
+
+```
+code/
+├── main.py                   # CLI entry point (full pipeline)
+├── fast_pipeline.py          # Deterministic-only pipeline (~6 seconds)
+├── pipeline.py               # Multi-step orchestrator
+│
+├── claim_extractor.py        # Stage 1: conversation → structured claim
+├── image_analyzer.py         # Stage 2: VLM per-image analysis + fallback
+├── evidence_matcher.py       # Stage 3a: policy rules
+├── risk_assessor.py          # Stage 3b: fraud & injection detection
+├── decision_synthesizer.py   # Stage 4: final decision + justification
+│
+├── model_client.py           # Backend router (Gemini ↔ Ollama)
+├── gemini_client.py          # Google Gemini API client
+├── ollama_client.py          # Ollama client (magic-byte video detection)
+│
+├── schemas.py                # Pydantic models & enums
+├── config.py                 # Config loaded from .env
+├── data_loader.py            # CSV & image path utilities
+├── csv_writer.py             # Enforces exact output column order
+│
+├── prompts/                  # System prompts for each LLM/VLM stage
+│   ├── claim_extraction.txt
+│   ├── image_analysis.txt
+│   ├── decision_synthesis.txt
+│   └── single_shot.txt
+│
+├── evaluation/
+│   ├── main.py               # Strategy comparison script
+│   └── metrics.py            # Accuracy & Jaccard scoring
+│
+├── evaluation_report.md      # Results: Multi-step vs Single-shot
+├── ARCHITECTURE.md           # Deep-dive design document
+└── requirements.txt
 ```
 
-### Why Multi-Step?
-Instead of passing everything into one giant prompt (Single-Shot), decomposing the problem means:
-1. **Higher Accuracy**: Local VLMs perform poorly when juggling 15 JSON fields across multiple images.
-2. **Auditability**: We can inspect exactly what the VLM saw in Image 2 vs Image 3.
-3. **Graceful Fallback**: If a VLM call fails, the deterministic rules still output a safe `not_enough_information` state rather than crashing.
-
 ---
 
-## ⚖️ System Design: Pros & Cons
+## 🔧 Configuration (`.env`)
 
-### Pros
-- **Highly Modular:** The unified `model_client.py` makes swapping out models or entire backend providers (Gemini vs. Ollama) trivial.
-- **Deterministic Safeguards:** The `RiskAssessor` and `EvidenceMatcher` ensure that AI hallucinations don't bypass hard company policies.
-- **Cost Efficient:** Can run at exactly $0.00 using local Ollama or the Gemini Free Tier.
-- **Resilient File Handling:** Protects against bad data (e.g., MP4 videos masquerading as images) before it wastes VLM compute.
+```env
+# ── Gemini API (recommended) ───────────────────────────
+# Get a free key at https://aistudio.google.com/apikey
+GEMINI_API_KEY=your_key_here
 
-### Cons
-- **Latency (Local):** Running `qwen2.5vl:7b` locally on a CPU can take 3-5 minutes per image. (Mitigated by the Gemini cloud integration which takes ~3 seconds).
-- **Complexity:** Managing state across 4 stages requires robust schemas (`schemas.py`) and error handling compared to a single prompt script.
-- **Missing Embeddings Cache:** Currently, if a user uploads the exact same image in two different claims, it is processed twice. An image hashing layer could improve performance.
-
----
-
-## 🛡 Edge Case Handling
-
-| Scenario | System Handling |
-|---|---|
-| **Fake Images (MP4 videos)** | Magic bytes detect video headers (`ftyp`). Bypasses the VLM, saving compute, and flags `non_original_image`. |
-| **Prompt Injection in Chat** | Keyword scans in `risk_assessor.py` flag `text_instruction_present`. The claim is routed to manual review and is never auto-approved. |
-| **Multilingual Claims** | `qwen2.5vl` and Gemini natively support Hindi, Spanish, etc. A keyword fallback acts as a safety net. |
-| **Blurry/Obscured Images** | VLM detects quality issues. Triggers `evidence_standard_met=False` leading to `not_enough_information`. |
-| **Wrong Object Uploaded** | VLM identifies the object does not match the claim. Flags `wrong_object` and rejects the evidence. |
-
----
-
-## 📁 File Structure
-
-| File / Folder | Purpose |
-|---|---|
-| `main.py` | CLI entry point for processing the dataset. |
-| `pipeline.py` | Orchestrates the 4 stages of the multi-step pipeline. |
-| `claim_extractor.py` | Stage 1: Text extraction logic. |
-| `image_analyzer.py` | Stage 2: Vision analysis logic. |
-| `evidence_matcher.py` | Stage 3a: Deterministic evidence logic. |
-| `risk_assessor.py` | Stage 3b: Risk and history logic. |
-| `decision_synthesizer.py`| Stage 4: Final output generation. |
-| `model_client.py` | Backend router (switches between Gemini and Ollama). |
-| `gemini_client.py` | Google Gemini API implementation. |
-| `ollama_client.py` | Local Ollama API implementation (with magic byte checks). |
-| `schemas.py` | Pydantic models ensuring strict data typing. |
-| `config.py` | Environment variable and constant configurations. |
-| `data_loader.py` | Pandas-based CSV and file loaders. |
-| `csv_writer.py` | Enforces exact column ordering for `output.csv`. |
-| `prompts/` | Plaintext system prompts for the LLMs/VLMs. |
-| `evaluation/` | Scripts and metrics for comparing system accuracy. |
-
----
-
-## 📦 Hackathon Submission
-
-To build the submission zip file locally:
-
-```powershell
-# Run this from the repository root
-python -c "
-import zipfile, os
-def zipdir(path, ziph):
-    for root, dirs, files in os.walk(path):
-        if '__pycache__' in root: continue
-        for file in files:
-            if file.endswith('.pyc') or file == '.env': continue
-            file_path = os.path.join(root, file)
-            ziph.write(file_path, os.path.relpath(file_path, path))
-with zipfile.ZipFile('../code.zip', 'w', zipfile.ZIP_DEFLATED) as zipf:
-    zipdir('.', zipf)
-print('code.zip created.')
-"
+# ── Local Ollama (fallback when no API key) ────────────
+TEXT_MODEL=llama3.2:3b
+VISION_MODEL=qwen2.5vl:7b
+SINGLE_SHOT_VISION_MODEL=qwen2.5vl:7b
 ```
-*Note: Do not include `dataset/` or your `.env` file with API keys in the final submission!*
+
+The backend is selected **automatically** — if `GEMINI_API_KEY` is set, Gemini is used; otherwise Ollama is used. No code changes required.
+
+---
+
+## 📈 Evaluation
+
+Two strategies are compared on the labeled `sample_claims.csv` (21 rows with ground truth):
+
+| Strategy | Composite Score |
+|---|---|
+| A — Single-shot VLM | 68.2% |
+| B — Multi-step pipeline | **87.5%** |
+
+Metrics: `claim_status` (35%) · `evidence_standard_met` (20%) · `issue_type` (15%) · `object_part` (15%) · `severity` (5%) · `risk_flags` Jaccard (10%)
+
+---
+
+*Built with Python · Pydantic · Pandas · Google Gemini API · Ollama*

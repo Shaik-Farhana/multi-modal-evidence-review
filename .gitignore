@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Environment variables (contains API keys)
+.env
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Zip artifacts
+code.zip
+
+# Test/dev output CSVs (only keep final output.csv)
+output_test.csv
+output_test3.csv
+output_sample_test.csv
+output_fallback.csv
+
+# macOS
+.DS_Store
+
+# Dataset (submitted separately)
+# dataset/
